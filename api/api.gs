@@ -1594,6 +1594,7 @@ function actionLogin(payload) {
         
         // For email_otp, automatically send the code
         if (singleMethod === 'email_otp') {
+          Logger.log('actionLogin: auto-sending email OTP for username=' + username);
           const otpResult = actionRequestOTP({ username: username });
           if (!otpResult.success) {
             return otpResult;
@@ -2205,21 +2206,24 @@ function actionRequestOTP(payload) {
     const user = getUserByUsername(payload.username);
     
     if (!user) {
-      return { success: false, error: 'ERR_USER_NOT_FOUND' };
+      return { success: false, error: 'ERR_USER_NOT_FOUND', debug: { username: payload.username } };
     }
     
     // Get email from user record
     const email = user.email || payload.username;
     
+    Logger.log('actionRequestOTP: username=' + payload.username + ', resolved email=' + email);
+    
     // Rate limiting: max 5 requests per minute (skip for verification)
     if (!isVerification) {
       const rateLimit = checkRateLimit('otp:' + payload.username, 5, 60);
       if (!rateLimit.allowed) {
-        return { 
-          success: false, 
-          error: 'ERR_RATE_LIMITED: Demasiados códigos solicitados. Intenta más tarde.',
-          retryAfter: rateLimit.resetIn
-        };
+      return { 
+        success: false, 
+        error: 'ERR_RATE_LIMITED: Demasiados códigos solicitados. Intenta más tarde.',
+        retryAfter: rateLimit.resetIn,
+        debug: { username: payload.username, rateLimitKey: 'otp:' + payload.username }
+      };
       }
     }
     
@@ -2241,12 +2245,20 @@ function actionRequestOTP(payload) {
       sendOTPEmail(email, code);
     } catch (emailErr) {
       Logger.log('Error sending OTP email: ' + emailErr.message);
-      return { success: false, error: 'ERR_EMAIL_SEND: No se pudo enviar el código por email' };
+      return { 
+        success: false, 
+        error: 'ERR_EMAIL_SEND: No se pudo enviar el código por email',
+        debug: { email: email, error: emailErr.message }
+      };
     }
     
     logAccess(payload.username, true, 'OTP enviado por email');
     
-    return { success: true, message: 'Código enviado por email' };
+    return { 
+      success: true, 
+      message: 'Código enviado por email',
+      debug: { email: email }
+    };
   } catch (err) {
     return { success: false, error: err.message };
   }
@@ -2260,12 +2272,21 @@ function actionRequestOTP(payload) {
 function sendOTPEmail(email, code) {
   const congregationName = PropertiesService.getScriptProperties().getProperty('CONGREGATION_NAME') || 'Congregación';
   
-  MailApp.sendEmail({
-    to: email,
-    subject: 'Código de verificación - Congre-Admin',
-    name: 'Congre-Admin',
-    body: 'Tu código de verificación es: ' + code + '\n\nEste código expira en 10 minutos.\n\nSi no solicitaste este código, puedes ignorar este email.'
-  });
+  Logger.log('sendOTPEmail: Attempting to send OTP to email: ' + email);
+  
+  try {
+    MailApp.sendEmail({
+      to: email,
+      subject: 'Código de verificación - Congre-Admin',
+      name: 'Congre-Admin',
+      body: 'Tu código de verificación es: ' + code + '\n\nEste código expira en 10 minutos.\n\nSi no solicitaste este código, puedes ignorar este email.'
+    });
+    Logger.log('sendOTPEmail: Email sent successfully');
+  } catch (emailErr) {
+    Logger.log('sendOTPEmail ERROR: ' + emailErr.message);
+    Logger.log('sendOTPEmail STACK: ' + emailErr.stack);
+    throw emailErr;
+  }
 }
 
 /**
@@ -3183,6 +3204,7 @@ function seedConfiguracion(ssId, datosCongregacion) {
       { clave: 'numero_congregacion', valor: datosCongregacion?.numero_congregacion || '', is_public: false },
       { clave: 'nombre_mostrar', valor: datosCongregacion?.nombre_mostrar || '', is_public: true },
       { clave: 'ss_publico', valor: datosCongregacion?.ss_publico || '', is_public: false },
+      { clave: 'linked_public_ss', valor: datosCongregacion?.linked_public_ss || '', is_public: false },
       { clave: 'idioma_predeterminado', valor: 'es', is_public: true },
       { clave: 'año_servicio_actual', valor: new Date().getFullYear().toString(), is_public: false },
       { clave: 'version_sistema', valor: '1.0.0', is_public: true }
@@ -3212,7 +3234,7 @@ function seedConfiguracion(ssId, datosCongregacion) {
  */
 function actionInstall(payload) {
   try {
-    const { nombreCongregacion, numeroCongregacion, nombreMostrar, perfiles } = payload;
+    const { nombreCongregacion, numeroCongregacion, nombreMostrar, perfiles, gasUrl } = payload;
     
     const nombreLimpio = (nombreCongregacion || 'SinNombre').replace(/[^a-zA-Z0-9]/g, '');
     
@@ -3231,7 +3253,7 @@ function actionInstall(payload) {
     let publicSsId = '';
     if (ssPublicResult.success) {
       publicSsId = ssPublicResult.ssId;
-      initPublicSheet(publicSsId);
+      initPublicSheet(publicSsId, ssId, gasUrl);
     }
     
     // 3. Inicializar tablas Core
@@ -3250,7 +3272,8 @@ function actionInstall(payload) {
       nombre_congregacion: nombreCongregacion || '',
       numero_congregacion: numeroCongregacion || '',
       nombre_mostrar: nombreMostrar || `Co. ${nombreCongregacion}`,
-      ss_publico: publicSsId
+      ss_publico: publicSsId,
+      linked_public_ss: publicSsId
     });
     
     // 6. Guardar configuración en propiedades del script
@@ -3277,14 +3300,22 @@ function actionInstall(payload) {
 /**
  * Inicializa la hoja pública para datos compartidos
  * @param {string} ssId - ID del spreadsheet público
+ * @param {string} adminSsId - ID del spreadsheet admin (core)
+ * @param {string} gasUrl - URL del GAS
  */
-function initPublicSheet(ssId) {
+function initPublicSheet(ssId, adminSsId, gasUrl) {
   try {
     const ss = SpreadsheetApp.openById(ssId);
     
+    createSheetIfNotExists(ss, 'Configuracion', ['clave', 'valor', 'is_public', '_v', '_ts', '_deleted']);
     createSheetIfNotExists(ss, 'Indice', ['modulo', 'titulo', 'actualizado']);
     createSheetIfNotExists(ss, 'Anuncios', ['titulo', 'contenido', 'fecha', 'publicado']);
     createSheetIfNotExists(ss, 'Reuniones', ['tipo', 'dia', 'hora', 'lugar', 'publicado']);
+    
+    // Guardar linked_admin_ss en Configuracion
+    const configSheet = ss.getSheetByName('Configuracion');
+    const linkedData = JSON.stringify({ ssId: adminSsId, gasUrl: gasUrl });
+    configSheet.appendRow(['linked_admin_ss', linkedData, false, 1, new Date().toISOString(), false]);
     
     return { success: true };
   } catch (err) {
