@@ -1,0 +1,15 @@
+[
+  { "clave": "nombre_congregacion", "valor": "", "is_public": false },
+  { "clave": "numero_congregacion", "valor": "", "is_public": false },
+  { "clave": "nombre_mostrar", "valor": "", "is_public": true },
+  { "clave": "ciudad", "valor": "", "is_public": true },
+  { "clave": "provincia", "valor": "", "is_public": true },
+  { "clave": "ss_publico", "valor": "", "is_public": false },
+  { "clave": "linked_public_ss", "valor": "", "is_public": false },
+  { "clave": "theme_config", "valor": "{\"primary\":\"#1976d2\",\"harmony\":\"complementary\",\"backgrounds\":{\"lightPage\":{\"mode\":\"auto\",\"value\":null},\"lightPanel\":{\"mode\":\"auto\",\"value\":null},\"darkPage\":{\"mode\":\"auto\",\"value\":null},\"darkPanel\":{\"mode\":\"auto\",\"value\":null}}}", "is_public": true },
+  { "clave": "icon_config", "valor": "{\"mode\":\"default\",\"text\":\"\",\"bgMode\":\"primary\",\"bgColor\":\"#1976d2\",\"textMode\":\"white\",\"textColor\":\"#ffffff\",\"sizes\":{}}", "is_public": true },
+  { "clave": "idioma_predeterminado", "valor": "es", "is_public": true },
+  { "clave": "zona_horaria", "valor": "America/Argentina/Buenos_Aires", "is_public": true },
+  { "clave": "año_servicio_actual", "valor": "2026", "is_public": false },
+  { "clave": "version_sistema", "valor": "1.0.0", "is_public": true }
+]

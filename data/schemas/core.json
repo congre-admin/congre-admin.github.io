@@ -1,0 +1,38 @@
+{
+  "version": "1.0.0",
+  "minVersion": "1.0.0",
+  "maxVersion": "1.0.0",
+  "description": "Schema definitions for Core spreadsheet tables",
+  "migrations": [
+    {
+      "from": "1.0.0",
+      "to": "1.1.0",
+      "steps": [
+        { "action": "addColumn", "table": "Usuarios", "column": "email", "position": "end" }
+      ],
+      "description": "Add email field to Usuarios"
+    }
+  ],
+  "tables": {
+    "Usuarios": {
+      "headers": ["id", "username", "email", "wrapped_mk", "perfilId", "auth_config", "metadata", "created_at", "_v", "_ts", "_deleted"],
+      "description": "Usuarios del sistema con credenciales y configuración de autenticación"
+    },
+    "Perfiles": {
+      "headers": ["id", "nombre", "permisos", "descripcion", "_v", "_ts", "_deleted"],
+      "description": "Perfiles RBAC con permisos por módulo"
+    },
+    "Registro_Plugins": {
+      "headers": ["plugin_id", "ssId", "status", "config", "_v", "_ts", "_deleted"],
+      "description": "Registro de plugins/modules vinculados al Core"
+    },
+    "Configuracion": {
+      "headers": ["clave", "valor", "is_public", "_v", "_ts", "_deleted"],
+      "description": "Configuración global del sistema"
+    },
+    "Sistema_Migraciones": {
+      "headers": ["id", "nombre", "version", "ejecutada_en", "estado", "error", "_v", "_ts"],
+      "description": "Registro de migraciones de esquema ejecutadas"
+    }
+  }
+}

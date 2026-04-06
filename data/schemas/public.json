@@ -1,0 +1,21 @@
+{
+  "version": "1.0.0",
+  "minVersion": "1.0.0",
+  "maxVersion": "1.0.0",
+  "description": "Schema definitions for Public spreadsheet tables (read-only guest access)",
+  "migrations": [],
+  "tables": {
+    "Configuracion": {
+      "headers": ["clave", "valor", "is_public", "_v", "_ts", "_deleted"],
+      "description": "Configuración pública de la congregación"
+    },
+    "Anuncios": {
+      "headers": ["id", "titulo", "contenido", "fecha_publicacion", "fecha_fin", "tipo", "_v", "_ts", "_deleted"],
+      "description": "Anuncios públicos visibles para todos los visitantes"
+    },
+    "Horario_Reuniones": {
+      "headers": ["id", "dia", "hora_inicio", "hora_fin", "tipo", "ubicacion", "_v", "_ts", "_deleted"],
+      "description": "Horario de reuniones públicas"
+    }
+  }
+}

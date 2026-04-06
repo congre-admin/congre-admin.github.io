@@ -1,0 +1,38 @@
+[
+  {
+    "id": "p_admin",
+    "nombre": "Super-Admin",
+    "permisos": { "core": "RW", "personas": "RW", "registros": "RW", "anuncios": "RW", "reuniones": "RW", "predicacion": "RW" },
+    "descripcion": "Acceso total al sistema"
+  },
+  {
+    "id": "p_secretario",
+    "nombre": "Secretario",
+    "permisos": { "core": { "configuracion": "R", "usuarios": "R", "perfiles": "R", "plugins": "R", "migraciones": "R", "*": "R" }, "personas": "RW", "registros": "RW", "anuncios": "RW", "reuniones": "R", "predicacion": "R" },
+    "descripcion": "Gestión de personas y registros"
+  },
+  {
+    "id": "p_comite",
+    "nombre": "Comité de Servicio",
+    "permisos": { "core": { "configuracion": "R", "usuarios": "R", "perfiles": "R", "plugins": "R", "migraciones": "R", "*": "R" }, "personas": "R", "registros": "R", "reuniones": "R", "predicacion": "R" },
+    "descripcion": "Supervisión general"
+  },
+  {
+    "id": "p_super_grupo",
+    "nombre": "Superintendente de Grupo",
+    "permisos": { "core": { "configuracion": "R", "usuarios": "R", "perfiles": "R", "plugins": "R", "migraciones": "R", "*": "R" }, "personas": "R", "registros": "RW", "reuniones": "R" },
+    "descripcion": "Informes y atención de grupo"
+  },
+  {
+    "id": "p_siervo_territorios",
+    "nombre": "Siervo de Territorios",
+    "permisos": { "core": { "configuracion": "R", "usuarios": "R", "perfiles": "R", "plugins": "R", "migraciones": "R", "*": "R" }, "predicacion": "RW" },
+    "descripcion": "Gestión de territorios y mapas"
+  },
+  {
+    "id": "p_publicador",
+    "nombre": "Publicador",
+    "permisos": { "core": { "configuracion": "R", "usuarios": "R", "perfiles": "R", "plugins": "R", "migraciones": "R", "*": "R" }, "reuniones": "R", "predicacion": "R" },
+    "descripcion": "Acceso básico"
+  }
+]
