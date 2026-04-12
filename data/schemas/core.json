@@ -11,11 +11,19 @@
         { "action": "addColumn", "table": "Usuarios", "column": "email", "position": "end" }
       ],
       "description": "Add email field to Usuarios"
+    },
+    {
+      "from": "1.1.0",
+      "to": "1.2.0",
+      "steps": [
+        { "action": "renameColumn", "table": "Usuarios", "oldName": "perfilId", "newName": "perfilIds", "transform": "jsonArrayWrap" }
+      ],
+      "description": "Change perfilId to perfilIds for multi-profile support"
     }
   ],
   "tables": {
     "Usuarios": {
-      "headers": ["id", "username", "email", "wrapped_mk", "perfilId", "auth_config", "metadata", "created_at", "_v", "_ts", "_deleted"],
+      "headers": ["id", "username", "email", "wrapped_mk", "perfilIds", "auth_config", "metadata", "created_at", "_v", "_ts", "_deleted"],
       "description": "Usuarios del sistema con credenciales y configuración de autenticación"
     },
     "Perfiles": {
@@ -23,7 +31,7 @@
       "description": "Perfiles RBAC con permisos por módulo"
     },
     "Registro_Plugins": {
-      "headers": ["plugin_id", "ssId", "status", "config", "_v", "_ts", "_deleted"],
+      "headers": ["plugin_id", "ssId", "status", "auth_required", "config", "_v", "_ts", "_deleted"],
       "description": "Registro de plugins/modules vinculados al Core"
     },
     "Configuracion": {
