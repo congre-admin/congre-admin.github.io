@@ -44,11 +44,13 @@ function doPost(e) {
     const ssId = payload.ssId || postData.ssId;
     const coreSsId = payload.coreSsId || ssId;
     const module = payload.module || null;
+    const mode = payload.mode || 'admin'; // 'admin' or 'public'
 
     // --- Auth actions (no ssId required) ---
+    const session = sessionToken ? validateSession(sessionToken, ssId) : null;
     const authActions = {
       login: () => actionLogin(payload, ssId),
-      register: () => actionRegister(payload, ssId),
+      register: () => actionRegister(payload, ssId, session),
       challenge: () => actionChallenge(payload, ssId),
       requestOTP: () => actionRequestOTP(payload, ssId),
       setupTOTP: () => actionSetupTOTP(payload, ssId),
@@ -65,6 +67,7 @@ function doPost(e) {
         const s = validateSession(sessionToken, ssId);
         return { valid: s.valid, userId: s.userId };
       },
+      confirmAction: () => actionConfirmAction(payload, sessionToken, ssId),
       refreshSession: () => refreshSessionToken(payload.sessionToken),
       logout: () => { invalidateSession(payload.sessionToken); return { success: true }; },
     };
@@ -90,11 +93,10 @@ function doPost(e) {
     if (!ssId) return createResponse({ error: 'ERR_SS_ID_REQUIRED: Se requiere ssId para operaciones de datos' });
 
     const ss = SpreadsheetApp.openById(ssId);
-    const session = sessionToken ? validateSession(sessionToken, ssId) : null;
 
     const dataActions = {
-      getData: () => dataActionGetData(session, ss, ssId, sheetName, module),
-      batchExecute: () => batchExecute(session, ss, ssId, payload, module),
+      getData: () => dataActionGetData(session, ss, ssId, sheetName, module, mode),
+      batchExecute: () => batchExecute(session, ss, ssId, payload, module, mode),
       initSheet: () => dataActionInitSheet(session, ss, ssId, sheetName, module, postData),
       clearSheet: () => dataActionClearSheet(session, ss, ssId, sheetName, module),
       saveData: () => dataActionSaveData(session, ss, ssId, sheetName, module, payload, postData),
@@ -103,8 +105,23 @@ function doPost(e) {
       restoreData: () => dataActionRestoreData(session, ss, ssId, sheetName, module, payload),
     };
 
-    if (!dataActions[action]) return createResponse({ error: 'Acción POST no válida: ' + action });
-    return createResponse(dataActions[action]());
+    if (dataActions[action]) return createResponse(dataActions[action]());
+
+    // --- Admin actions (require admin permission on 'core') ---
+    const adminActions = {
+      getUsers: () => actionGetUsers(session, ssId),
+      createUser: () => actionCreateUser(session, payload, ssId),
+      updateUser: () => actionUpdateUser(session, payload, ssId),
+      deleteUser: () => actionDeleteUser(session, payload, ssId),
+      getPerfiles: () => actionGetPerfiles(session, ssId),
+      createProfile: () => actionCreateProfile(session, payload, ssId),
+      updateProfile: () => actionUpdateProfile(session, payload, ssId),
+      deleteProfile: () => actionDeleteProfile(session, payload, ssId),
+    };
+
+    if (adminActions[action]) return createResponse(adminActions[action]());
+
+    return createResponse({ error: 'Acción POST no válida: ' + action });
   } catch (err) {
     return createResponse({ error: err.message });
   }
@@ -122,16 +139,49 @@ const BATCH_MAX_OPS = 50;
  * File ops: uploadFile, downloadFile, listFolderFiles, deleteFile, setFileSharing, moveFileToFolder.
  * Modes: "continue" (all ops, partial success) or "fail-fast" (stop on first error).
  */
-function batchExecute(session, ss, ssId, payload, module) {
+function batchExecute(session, ss, ssId, payload, module, accessMode) {
   const operations = payload.operations || [];
-  const mode = payload.mode || 'continue';
-  const isSetup = payload.isSetup === true;
+  const execMode = payload.mode || 'continue'; // 'continue' or 'fail-fast'
+  const isPublic = accessMode === 'public';
+  
+  // Server-side setup detection: only allow setup bypass if no users exist yet
+  const isServerSetup = !_hasExistingUsers(ssId);
+  const isSetup = isServerSetup || (payload.isSetup === true); // Accept legacy flag for backwards compat, but prefer server detection
+
+  // Plugin auth enforcement: check if module requires auth
+  let pluginAuthRequired = false;
+  if (module && module !== 'core' && !isServerSetup) {
+    try {
+      const pluginData = getCachedSheetData(ss, 'Registro_Plugins');
+      const plugin = pluginData.find(p => p.plugin_id === module);
+      if (plugin && plugin.auth_required === true) {
+        pluginAuthRequired = true;
+      }
+    } catch (e) {
+      // Registro_Plugins may not exist or accessible - fall back to session check
+    }
+  }
+  
+  // If plugin requires auth, session MUST be valid (even for read operations)
+  if (pluginAuthRequired && (!session || !session.valid)) {
+    return { success: false, error: 'ERR_PLUGIN_AUTH_REQUIRED: Este plugin requiere autenticación' };
+  }
 
   if (!operations.length) return { success: false, error: 'ERR_BATCH_EMPTY: No operations provided' };
   if (operations.length > BATCH_MAX_OPS) return { success: false, error: 'ERR_BATCH_TOO_LARGE: Max ' + BATCH_MAX_OPS + ' operations per call' };
 
-  // Setup mode: allow only initSheet and save, no session required
-  if (isSetup) {
+  // Public mode: only read ops allowed, filter is_public rows, strip enc_ fields
+  if (isPublic) {
+    const writeOps = ['save', 'delete', 'hardDelete', 'restore', 'initSheet', 'clearSheet', 'uploadFile', 'deleteFile', 'setFileSharing', 'moveFileToFolder'];
+    for (var i = 0; i < operations.length; i++) {
+      if (writeOps.includes(operations[i].op)) {
+        return { success: false, error: 'ERR_PUBLIC_READONLY: Public mode only allows read operations', failedAt: i };
+      }
+    }
+  }
+
+  // Setup mode: allow only initSheet and save, no session required (ONLY if server confirms no users)
+  if (isServerSetup) {
     const safeOps = ['initSheet', 'save'];
     for (var i = 0; i < operations.length; i++) {
       if (safeOps.indexOf(operations[i].op) === -1) {
@@ -140,8 +190,8 @@ function batchExecute(session, ss, ssId, payload, module) {
     }
   }
 
-  // RBAC pre-check for write operations (skipped in setup mode)
-  if (!isSetup) {
+  // RBAC pre-check for write operations (skipped only in true server-side setup mode)
+  if (!isServerSetup) {
     for (let i = 0; i < operations.length; i++) {
       const op = operations[i];
       if (['save', 'delete', 'hardDelete', 'restore', 'initSheet', 'uploadFile', 'deleteFile', 'setFileSharing', 'moveFileToFolder'].includes(op.op)) {
@@ -178,7 +228,7 @@ function batchExecute(session, ss, ssId, payload, module) {
     const result = { index: i, op: op.op, sheet: op.sheet };
 
     // Skip if fail-fast mode and previous op failed
-    if (mode === 'fail-fast' && failed > 0) {
+    if (execMode === 'fail-fast' && failed > 0) {
       result.success = false;
       result.error = 'ERR_SKIPPED: Previous operation failed';
       results.push(result);
@@ -190,7 +240,7 @@ function batchExecute(session, ss, ssId, payload, module) {
         case 'read': {
           const cached = getBatchSheet(ss, op.sheet, sheetCache);
           if (!cached) { result.success = false; result.error = 'Hoja no encontrada'; break; }
-          const data = cached.rows.map(row => {
+          let data = cached.rows.map(row => {
             const obj = {};
             cached.headers.forEach((h, j) => {
               let val = row[j];
@@ -201,6 +251,17 @@ function batchExecute(session, ss, ssId, payload, module) {
             });
             return obj;
           }).filter(row => row._deleted !== true && row._deleted !== 'true');
+          // Public mode: filter is_public rows and strip enc_ fields
+          if (isPublic) {
+            data = data.filter(row => row.is_public !== false && row.is_public !== 'false' && row.is_public !== 'NO');
+            data = data.map(row => {
+              const clean = {};
+              Object.keys(row).forEach(key => {
+                if (!key.startsWith('enc_')) clean[key] = row[key];
+              });
+              return clean;
+            });
+          }
           result.success = true;
           result.data = op.filter ? data.filter(r => matchFilter(r, op.filter)) : data;
           break;
@@ -475,7 +536,22 @@ function matchFilter(row, filter) {
 // DATA ACTIONS (thin wrappers with session + RBAC validation)
 // ================================================================= //
 
-function dataActionGetData(session, ss, ssId, sheetName, module) {
+function dataActionGetData(session, ss, ssId, sheetName, module, mode) {
+  // Public mode: no session required, filter is_public rows, strip enc_ fields
+  if (mode === 'public') {
+    const allData = getCachedSheetData(ss, sheetName);
+    const filtered = allData
+      .filter(row => row.is_public !== false && row.is_public !== 'false' && row.is_public !== 'NO')
+      .map(row => {
+        const clean = {};
+        Object.keys(row).forEach(key => {
+          if (!key.startsWith('enc_')) clean[key] = row[key];
+        });
+        return clean;
+      });
+    return { success: true, data: filtered };
+  }
+  // Admin mode: validate session and permissions
   if (session && session.valid) {
     const permCheck = checkPermission(session, 'read', sheetName, ssId, module);
     if (!permCheck.allowed) return { error: permCheck.error };
@@ -526,7 +602,75 @@ function dataActionSaveData(session, ss, ssId, sheetName, module, payload, postD
     existingRows = sheet.getDataRange().getValues();
   }
   updateOrInsert(sheet, payload, false, { existingRows });
+
+  // Auto-sync Configuracion to public sheet
+  if (sheetName === 'Configuracion') {
+    syncConfigToPublic(ss);
+  }
+
   return { success: true, message: 'Datos guardados' };
+}
+
+/**
+ * Syncs public settings (is_public=true) from Configuracion to public spreadsheet.
+ */
+function syncConfigToPublic(ss) {
+  // Get public spreadsheet ID
+  const configData = getCachedSheetData(ss, 'Configuracion');
+  const publicSsRow = configData.find(r => r.clave === 'ss_publico');
+  if (!publicSsRow || !publicSsRow.valor) return; // No public SS configured
+  const publicSsId = publicSsRow.valor;
+
+  // Open public spreadsheet
+  let publicSs;
+  try {
+    publicSs = SpreadsheetApp.openById(publicSsId);
+  } catch (e) {
+    return;
+  }
+
+  // Get public rows (is_public=true)
+  const publicRows = configData.filter(r => {
+    return r.is_public !== false && r.is_public !== 'false' && r.is_public !== 'NO';
+  });
+
+  if (publicRows.length === 0) return;
+
+  // Strip enc_ fields and prepare
+  const cleanRows = publicRows.map(row => {
+    const clean = {};
+    for (const key in row) {
+      if (!key.startsWith('enc_')) clean[key] = row[key];
+    }
+    return clean;
+  });
+
+  // Get or create Configuracion sheet in public spreadsheet
+  let targetSheet = publicSs.getSheetByName('Configuracion');
+  const headers = ['clave', 'valor', 'is_public', '_v', '_ts', '_deleted'];
+  if (!targetSheet) {
+    targetSheet = publicSs.insertSheet('Configuracion');
+    targetSheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold').setBackground('#f3f3f3');
+  }
+
+  // Clear and rewrite all public config
+  const lastRow = targetSheet.getLastRow();
+  if (lastRow > 1) {
+    targetSheet.getRange(2, 1, lastRow - 1, headers.length).clearContent();
+  }
+
+  // Write clean rows
+  const values = cleanRows.map(row => {
+    return headers.map(h => {
+      const val = row[h];
+      if (val === undefined || val === null) return '';
+      return (typeof val === 'object') ? JSON.stringify(val) : val;
+    });
+  });
+
+  if (values.length > 0) {
+    targetSheet.getRange(2, 1, values.length, headers.length).setValues(values);
+  }
 }
 
 function dataActionDeleteData(session, ss, ssId, sheetName, module, payload) {
@@ -776,6 +920,7 @@ function createResponse(data) {
 // ================================================================= //
 
 const SESSION_TTL = 86400; // 24 hours in seconds
+const CONFIRM_ACTION_TTL = 1800; // 30 minutes in seconds (step-up auth inactivity)
 
 // --- User Lookup ---
 
@@ -797,6 +942,19 @@ function getUserById(id, ssId) {
     if (!sheet) return null;
     return getSheetData(sheet).find(row => row.id === id) || null;
   });
+}
+
+// --- Security: Check if system is initialized ---
+function _hasExistingUsers(ssId) {
+  try {
+    const sheet = getUsuariosSheet(ssId);
+    if (!sheet) return false;
+    const data = getCachedSheetData(sheet.getParent(), 'Usuarios');
+    // Check for any non-deleted users
+    return data.some(row => row._deleted !== true && row._deleted !== 'true' && row.username);
+  } catch (e) {
+    return false;
+  }
 }
 
 // --- Password ---
@@ -869,7 +1027,7 @@ function createUser(userData, ssId) {
     username: userData.username,
     email: userData.email || '',
     wrapped_mk: userData.wrapped_mk || '',
-    perfilId: userData.perfilId || 'p_publicador',
+    perfilIds: JSON.stringify(userData.perfilIds || ['p_publicador']),
     auth_config: JSON.stringify(authConfig),
     metadata: JSON.stringify(metadata),
     created_at: now,
@@ -943,6 +1101,241 @@ function getUserMetadataValue(userId, key, ssId) {
 function invalidateAllUserSessions(userId) {
   const sessions = getUserSessions(userId);
   sessions.forEach(s => { try { invalidateSession(s.token); } catch (e) {} });
+}
+
+// ================================================================= //
+// ADMIN ACTIONS — User & Profile Management
+// ================================================================= //
+
+function actionGetUsers(session, ssId) {
+  // Require admin permission on 'core' module
+  if (!validarPermiso(session.userId, 'core', 'read', ssId, 'Usuarios')) {
+    throw new Error('ERR_PERMISSION_DENIED: No tienes permiso para ver usuarios');
+  }
+  
+  const sheet = getUsuariosSheet(ssId);
+  if (!sheet) throw new Error('ERR_SHEET_NOT_FOUND: Hoja Usuarios no encontrada');
+  
+  const allUsers = getSheetData(sheet);
+  const allPerfiles = getAllPerfiles(ssId);
+  
+  // Parse perfilIds and enrich with profile names
+  const users = allUsers
+    .filter(u => !u._deleted || u._deleted !== 'true')
+    .map(u => {
+      let perfilIds = [];
+      try { perfilIds = u.perfilIds ? JSON.parse(u.perfilIds) : []; } catch (e) { perfilIds = []; }
+      
+      // Resolve profile names
+      const perfiles = perfilIds.map(pid => {
+        const p = allPerfiles.find(pf => pf.id === pid);
+        return p ? { id: pf.id, nombre: pf.nombre } : { id: pid, nombre: pid };
+      });
+      
+      // Parse metadata
+      let metadata = {};
+      try { metadata = u.metadata ? JSON.parse(u.metadata) : {}; } catch (e) {}
+      
+      // Parse auth_config for display
+      let authConfig = {};
+      try { authConfig = u.auth_config ? JSON.parse(u.auth_config) : {}; } catch (e) {}
+      
+      return {
+        id: u.id,
+        username: u.username,
+        email: u.email || '',
+        perfilIds: perfilIds,
+        perfiles: perfiles,
+        active: !u._deleted || u._deleted !== 'true',
+        created_at: u.created_at,
+        last_login: metadata.last_login || null,
+        failed_attempts: metadata.failed_login_attempts || 0,
+        has_password: !!(authConfig.password_hash),
+        has_totp: !!(authConfig.totp && authConfig.totp.enabled),
+        has_passkeys: !!(authConfig.passkeys && authConfig.passkeys.length > 0),
+      };
+    });
+  
+  return { success: true, users: users };
+}
+
+function actionCreateUser(session, payload, ssId) {
+  if (!validarPermiso(session.userId, 'core', 'write', ssId, 'Usuarios')) {
+    throw new Error('ERR_PERMISSION_DENIED: No tienes permiso para crear usuarios');
+  }
+  
+  const { username, email, password, perfilIds, wrapped_mk } = payload;
+  
+  if (!username) throw new Error('ERR_USERNAME_REQUIRED: El nombre de usuario es requerido');
+  if (!password) throw new Error('ERR_PASSWORD_REQUIRED: La contraseña es requerida');
+  
+  // Default to p_publicador if no profiles specified
+  const finalPerfilIds = perfilIds && perfilIds.length > 0 ? perfilIds : ['p_publicador'];
+  
+  const result = createUser({ username, email, password, perfilIds: finalPerfilIds, wrapped_mk }, ssId);
+  return result;
+}
+
+function actionUpdateUser(session, payload, ssId) {
+  if (!validarPermiso(session.userId, 'core', 'write', ssId, 'Usuarios')) {
+    throw new Error('ERR_PERMISSION_DENIED: No tienes permiso para modificar usuarios');
+  }
+  
+  const { id, username, email, perfilIds, active } = payload;
+  
+  if (!id) throw new Error('ERR_USER_ID_REQUIRED: El ID de usuario es requerido');
+  
+  const user = getUserById(id, ssId);
+  if (!user) throw new Error('ERR_USER_NOT_FOUND: Usuario no encontrado');
+  
+  // Prevent modifying own admin account
+  if (id === session.userId) {
+    throw new Error('ERR_SELF_MODIFY: No puedes modificar tu propia cuenta de administrador');
+  }
+  
+  const updates = {};
+  if (username !== undefined) updates.username = username;
+  if (email !== undefined) updates.email = email;
+  if (perfilIds !== undefined) updates.perfilIds = JSON.stringify(perfilIds);
+  if (active !== undefined) updates._deleted = active ? 'false' : 'true';
+  
+  updateUser(id, updates, ssId);
+  invalidateCache('u:');
+  return { success: true };
+}
+
+function actionDeleteUser(session, payload, ssId) {
+  if (!validarPermiso(session.userId, 'core', 'write', ssId, 'Usuarios')) {
+    throw new Error('ERR_PERMISSION_DENIED: No tienes permiso para eliminar usuarios');
+  }
+  
+  const { id } = payload;
+  
+  if (!id) throw new Error('ERR_USER_ID_REQUIRED: El ID de usuario es requerido');
+  
+  const user = getUserById(id, ssId);
+  if (!user) throw new Error('ERR_USER_NOT_FOUND: Usuario no encontrado');
+  
+  // Prevent deleting own admin account
+  if (id === session.userId) {
+    throw new Error('ERR_SELF_DELETE: No puedes eliminar tu propia cuenta de administrador');
+  }
+  
+  // Soft delete (mark as deleted)
+  updateUser(id, { _deleted: 'true' }, ssId);
+  invalidateCache('u:');
+  
+  // Invalidate all sessions for this user
+  invalidateAllUserSessions(id);
+  
+  return { success: true };
+}
+
+function actionGetPerfiles(session, ssId) {
+  if (!validarPermiso(session.userId, 'core', 'read', ssId, 'Perfiles')) {
+    throw new Error('ERR_PERMISSION_DENIED: No tienes permiso para ver perfiles');
+  }
+  
+  const perfiles = getAllPerfiles(ssId);
+  
+  const parsedPerfiles = perfiles
+    .filter(p => !p._deleted || p._deleted !== 'true')
+    .map(p => {
+      let permisos = {};
+      try { permisos = p.permisos ? JSON.parse(p.permisos) : {}; } catch (e) { permisos = {}; }
+      
+      return {
+        id: p.id,
+        nombre: p.nombre,
+        descripcion: p.descripcion || '',
+        permisos: permisos,
+        _v: p._v,
+      };
+    });
+  
+  return { success: true, perfiles: parsedPerfiles };
+}
+
+function actionCreateProfile(session, payload, ssId) {
+  if (!validarPermiso(session.userId, 'core', 'write', ssId, 'Perfiles')) {
+    throw new Error('ERR_PERMISSION_DENIED: No tienes permiso para crear perfiles');
+  }
+  
+  const { id, nombre, descripcion, permisos } = payload;
+  
+  if (!id) throw new Error('ERR_PROFILE_ID_REQUIRED: El ID de perfil es requerido');
+  if (!nombre) throw new Error('ERR_PROFILE_NAME_REQUIRED: El nombre de perfil es requerido');
+  
+  // Check if profile with same id exists
+  const existing = getPerfilById(id, ssId);
+  if (existing) throw new Error('ERR_PROFILE_EXISTS: Ya existe un perfil con ese ID');
+  
+  const sheet = getPerfilesSheet(ssId);
+  if (!sheet) throw new Error('ERR_SHEET_NOT_FOUND: Hoja Perfiles no encontrada');
+  
+  const profile = {
+    id: id,
+    nombre: nombre,
+    descripcion: descripcion || '',
+    permisos: JSON.stringify(permisos || {}),
+    _ts: new Date().toISOString(),
+  };
+  
+  updateOrInsert(sheet, profile, false);
+  invalidateCache('p:');
+  return { success: true, profile: { id: profile.id, nombre: profile.nombre } };
+}
+
+function actionUpdateProfile(session, payload, ssId) {
+  if (!validarPermiso(session.userId, 'core', 'write', ssId, 'Perfiles')) {
+    throw new Error('ERR_PERMISSION_DENIED: No tienes permiso para modificar perfiles');
+  }
+  
+  const { id, nombre, descripcion, permisos } = payload;
+  
+  if (!id) throw new Error('ERR_PROFILE_ID_REQUIRED: El ID de perfil es requerido');
+  
+  const sheet = getPerfilesSheet(ssId);
+  if (!sheet) throw new Error('ERR_SHEET_NOT_FOUND: Hoja Perfiles no encontrada');
+  
+  const existing = getPerfilById(id, ssId);
+  if (!existing) throw new Error('ERR_PROFILE_NOT_FOUND: Perfil no encontrado');
+  
+  const updates = {};
+  if (nombre !== undefined) updates.nombre = nombre;
+  if (descripcion !== undefined) updates.descripcion = descripcion;
+  if (permisos !== undefined) updates.permisos = JSON.stringify(permisos);
+  updates._ts = new Date().toISOString();
+  
+  updateOrInsert(sheet, { ...existing, ...updates }, false);
+  invalidateCache('p:');
+  return { success: true };
+}
+
+function actionDeleteProfile(session, payload, ssId) {
+  if (!validarPermiso(session.userId, 'core', 'write', ssId, 'Perfiles')) {
+    throw new Error('ERR_PERMISSION_DENIED: No tienes permiso para eliminar perfiles');
+  }
+  
+  const { id } = payload;
+  
+  if (!id) throw new Error('ERR_PROFILE_ID_REQUIRED: El ID de perfil es requerido');
+  
+  // Prevent deleting system profiles
+  if (id === 'p_admin' || id === 'p_publicador') {
+    throw new Error('ERR_PROFILE_PROTECTED: No puedes eliminar perfiles del sistema');
+  }
+  
+  const sheet = getPerfilesSheet(ssId);
+  if (!sheet) throw new Error('ERR_SHEET_NOT_FOUND: Hoja Perfiles no encontrada');
+  
+  const existing = getPerfilById(id, ssId);
+  if (!existing) throw new Error('ERR_PROFILE_NOT_FOUND: Perfil no encontrado');
+  
+  // Soft delete
+  updateOrInsert(sheet, { ...existing, _deleted: 'true', _ts: new Date().toISOString() }, false);
+  invalidateCache('p:');
+  return { success: true };
 }
 
 // --- Auth Helpers ---
@@ -1091,9 +1484,17 @@ function actionLogin(payload, ssId) {
   }
 }
 
-function actionRegister(payload, ssId) {
+function actionRegister(payload, ssId, session) {
   try {
     if (!ssId) return { success: false, error: 'ERR_SS_ID_REQUIRED' };
+    
+    // Security: If system already has users, require authenticated session with admin permissions
+    if (_hasExistingUsers(ssId)) {
+      if (!session || !session.valid) return { success: false, error: 'ERR_AUTH_REQUIRED: Sistema ya inicializado. Inicia sesión primero.' };
+      const permCheck = checkPermission(session, 'write', 'usuarios', ssId, 'core');
+      if (!permCheck.allowed) return { success: false, error: 'ERR_PERMISSION_DENIED: No tienes permiso para crear usuarios.' };
+    }
+    
     if (!payload.email || !payload.email.trim()) return { success: false, error: 'ERR_EMAIL_REQUIRED: El email es requerido' };
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(payload.email.trim())) return { success: false, error: 'ERR_EMAIL_INVALID: Formato de email inválido' };
 
@@ -1445,6 +1846,90 @@ function actionSetDefaultAuthMethod(payload, sessionToken, ssId) {
   }
 }
 
+/**
+ * Confirms a sensitive action with 2FA (step-up authentication).
+ * Validates session, checks trigger, then validates second factor.
+ */
+function actionConfirmAction(payload, sessionToken, ssId) {
+  const { code, passkeyAssertion } = payload;
+  
+  // Validate session first
+  const session = validateSession(sessionToken, ssId);
+  if (!session.valid) return { confirmed: false, error: 'ERR_AUTH_INVALID' };
+  
+  const user = getUserById(session.userId, ssId);
+  if (!user) return { confirmed: false, error: 'ERR_USER_NOT_FOUND' };
+  
+  // Check if user is locked
+  const metadata = parseUserMetadata(user.metadata);
+  if (metadata?.locked) return { confirmed: false, error: 'ERR_ACCOUNT_LOCKED', locked: true };
+  
+  // Check inactivity timeout (if lastAction exists)
+  if (metadata?.lastAction) {
+    const lastActionTime = new Date(metadata.lastAction).getTime();
+    const idleMs = Date.now() - lastActionTime;
+    const idleSeconds = Math.floor(idleMs / 1000);
+    if (idleSeconds > CONFIRM_ACTION_TTL) {
+      // Need re-confirmation due to inactivity
+      return { confirmed: false, error: 'ERR_CONFIRM_REQUIRED_INACTIVITY', needsConfirmation: true, idleSeconds };
+    }
+  }
+  
+  // Check failed attempts
+  const failedAttempts = metadata?.confirm_failed_attempts || 0;
+  if (failedAttempts >= 5) {
+    // Lock account
+    updateUserMetadata(user.id, { locked: true, locked_at: new Date().toISOString() }, ssId);
+    return { confirmed: false, error: 'ERR_ACCOUNT_LOCKED', locked: true };
+  }
+  
+  const authConfig = parseAuthConfig(user.auth_config);
+  const enabledMethods = getEnabledMethods(authConfig);
+  
+  if (enabledMethods.length === 0) {
+    // No 2FA configured - fail safe, require password
+    return { confirmed: false, error: 'ERR_2FA_NOT_CONFIGURED', requiresPassword: true };
+  }
+  
+  // Validate based on default method
+  const defaultMethod = authConfig.default_method;
+  let isValid = false;
+  let error = 'ERR_CONFIRM_FAILED';
+  
+  if (defaultMethod === 'totp' && authConfig.totp?.enabled) {
+    if (!code) return { confirmed: false, error: 'ERR_CODE_REQUIRED', method: 'totp' };
+    isValid = verifyTOTP(authConfig.totp.secret, code);
+    if (!isValid) error = 'ERR_INVALID_CODE';
+  } else if (defaultMethod === 'email_otp' && authConfig.email_otp?.enabled) {
+    if (!code) return { confirmed: false, error: 'ERR_CODE_REQUIRED', method: 'email_otp' };
+    isValid = verifyEmailOTP(user.username, code);
+    if (!isValid) error = 'ERR_INVALID_CODE';
+  } else if (defaultMethod === 'passkey' && authConfig.passkeys?.length > 0) {
+    if (!passkeyAssertion) return { confirmed: false, error: 'ERR_PASSKEY_REQUIRED', method: 'passkey' };
+    // Passkey validation happens at browser level - trust the assertion if received
+    if (!passkeyAssertion.credentialId) {
+      isValid = false;
+      error = 'ERR_INVALID_PASSKEY';
+    } else {
+      isValid = true;
+    }
+  } else {
+    // Fallback - no valid 2FA method
+    return { confirmed: false, error: 'ERR_2FA_NOT_CONFIGURED', requiresPassword: true };
+  }
+  
+  if (!isValid) {
+    // Increment failed attempts
+    updateUserMetadata(user.id, { confirm_failed_attempts: failedAttempts + 1 }, ssId);
+    const remaining = 5 - failedAttempts - 1;
+    return { confirmed: false, error, remainingAttempts: remaining };
+  }
+  
+  // Success - reset failed attempts and update lastAction
+  updateUserMetadata(user.id, { confirm_failed_attempts: 0, lastAction: new Date().toISOString() }, ssId);
+  return { confirmed: true };
+}
+
 // ================================================================= //
 // SESSION MANAGEMENT
 // ================================================================= //
@@ -1630,23 +2115,85 @@ function getPermiso(perfilId, modulo, ssId) {
   return normalizePermisos(perfil.permisos)[modulo] || null;
 }
 
-function validarPermiso(userId, modulo, accion, ssId, sheetName) {
+/**
+ * Get merged permissions from all user profiles.
+ * Returns: { modulo: { read: bool, write: bool, delete: bool, export: bool } }
+ */
+function getUserPermissions(userId, ssId) {
   const user = getUserById(userId, ssId);
-  if (!user) return false;
-  const modulePerm = getPermiso(user.perfilId, modulo, ssId);
+  if (!user) return {};
+  
+  // Parse perfilIds
+  let perfilIds = [];
+  try { perfilIds = user.perfilIds ? JSON.parse(user.perfilIds) : []; } catch (e) { perfilIds = []; }
+  
+  // Default to p_publicador if empty
+  if (!perfilIds.length) perfilIds = ['p_publicador'];
+  
+  // Merge permissions from all profiles
+  const merged = {};
+  
+  for (const pid of perfilIds) {
+    const perfil = getPerfilById(pid, ssId);
+    if (!perfil) continue;
+    
+    const perms = normalizePermisos(perfil.permisos);
+    
+    for (const [modulo, perm] of Object.entries(perms)) {
+      // Handle granular format: { read: true, write: true, ... }
+      if (typeof perm === 'object') {
+        if (!merged[modulo]) merged[modulo] = { read: false, write: false, delete: false, export: false };
+        merged[modulo].read = merged[modulo].read || perm.read || perm.R || perm.RW;
+        merged[modulo].write = merged[modulo].write || perm.write || perm.W || perm.RW;
+        merged[modulo].delete = merged[modulo].delete || perm.delete || perm.D || perm.RW;
+        merged[modulo].export = merged[modulo].export || perm.export || perm.E || perm.RW;
+      } 
+      // Handle flat format: "RW", "R", "W", "none"
+      else if (typeof perm === 'string') {
+        if (!merged[modulo]) merged[modulo] = { read: false, write: false, delete: false, export: false };
+        const p = perm.toUpperCase();
+        if (p === 'RW' || p === 'R') merged[modulo].read = true;
+        if (p === 'RW' || p === 'W') { merged[modulo].write = true; merged[modulo].delete = true; }
+        if (p === 'RW' || p === 'E') merged[modulo].export = true;
+      }
+    }
+  }
+  
+  return merged;
+}
+
+/**
+ * Validate user permission, merging from all profiles.
+ * For granular: checks { read, write, delete } directly
+ * For flat: maps "R"→read, "W"→write, "RW"→all
+ */
+function validarPermiso(userId, modulo, accion, ssId, sheetName) {
+  const perms = getUserPermissions(userId, ssId);
+  const modulePerm = perms[modulo] || perms[sheetName] || perms['*'];
+  
   if (!modulePerm) return false;
-  const permiso = resolvePermission(modulePerm, sheetName || '');
-  if (!permiso) return false;
-  const map = { read: ['R', 'RW'], write: ['W', 'RW'], delete: ['RW'] };
-  return (map[accion] || []).includes(permiso);
+  
+  // Handle granular object format
+  if (typeof modulePerm === 'object') {
+    if (accion === 'read') return !!modulePerm.read;
+    if (accion === 'write') return !!modulePerm.write;
+    if (accion === 'delete') return !!modulePerm.delete;
+    if (accion === 'export') return !!modulePerm.export;
+    return false;
+  }
+  
+  // Handle flat string format
+  if (typeof modulePerm === 'string') {
+    const p = modulePerm.toUpperCase();
+    const map = { read: ['R', 'RW'], write: ['W', 'RW'], delete: ['RW'], export: ['E', 'RW'] };
+    return (map[accion] || []).includes(p);
+  }
+  
+  return false;
 }
 
 function getUserPermisos(userId, ssId) {
-  const user = getUserById(userId, ssId);
-  if (!user) return {};
-  const perfil = getPerfilById(user.perfilId, ssId);
-  if (!perfil) return {};
-  return normalizePermisos(perfil.permisos);
+  return getUserPermissions(userId, ssId);
 }
 
 function checkPermission(session, action, sheetName, ssId, module) {
